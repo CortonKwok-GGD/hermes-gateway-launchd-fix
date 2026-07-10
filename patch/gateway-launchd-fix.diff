@@ -1,0 +1,197 @@
+--- /opt/homebrew/lib/python3.11/site-packages/hermes_cli/gateway.py.bak.20260710-101537	2026-07-10 10:15:37
++++ /opt/homebrew/lib/python3.11/site-packages/hermes_cli/gateway.py	2026-07-10 10:16:54
+@@ -3145,6 +3145,51 @@
+ # =============================================================================
+ # Launchd (macOS)
+ # =============================================================================
++
++
++def _is_macos_26_or_later() -> bool:
++    """Return True on macOS 26+ where ``launchctl bootstrap`` is broken (exit 5).
++
++    ``launchctl bootstrap`` returns exit code 5 (EIO) on macOS 26+, and the
++    plist ``LimitLoadToSessionType`` key causes silent load failures during
++    login auto-load (#23387).  We fall back to the older ``launchctl load`` +
++    ``launchctl enable`` combination on affected hosts.
++    """
++    if sys.platform != "darwin":
++        return False
++    try:
++        import platform
++        ver = platform.mac_ver()[0]
++        if ver:
++            return int(ver.split(".")[0]) >= 26
++    except Exception:
++        pass
++    return False
++
++
++def _launchd_load(plist_path: str | Path) -> None:
++    """Load the plist into launchd using the correct method for this macOS version.
++
++    On macOS 26+, ``launchctl bootstrap`` is broken (exit 5, #23387), so we
++    use ``launchctl load`` + ``launchctl enable`` instead.  On older macOS,
++    ``bootstrap`` (the modern API) is preferred.
++    """
++    domain = _launchd_domain()
++    label = get_launchd_label()
++    if _is_macos_26_or_later():
++        subprocess.run(
++            ["launchctl", "load", str(plist_path)],
++            check=True, timeout=30,
++        )
++        subprocess.run(
++            ["launchctl", "enable", f"{domain}/{label}"],
++            check=True, timeout=30,
++        )
++    else:
++        subprocess.run(
++            ["launchctl", "bootstrap", domain, str(plist_path)],
++            check=True, timeout=30,
++        )
+ 
+ 
+ def get_launchd_label() -> str:
+@@ -3402,12 +3447,7 @@
+         <string>{hermes_home}</string>
+     </dict>
+ 
+-    <key>LimitLoadToSessionType</key>
+-    <array>
+-        <string>Aqua</string>
+-        <string>Background</string>
+-    </array>
+-    
++
+     <key>RunAtLoad</key>
+     <true/>
+     
+@@ -3478,12 +3518,21 @@
+         # Delegate to a new session: `start_new_session=True` detaches the
+         # helper from the gateway's process group, so the bootout that kills
+         # the gateway (and us) does not kill the helper before it bootstraps.
+-        reload_script = (
+-            f"sleep 2; "
+-            f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
+-            f"sleep 1; "
+-            f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null"
+-        )
++        if _is_macos_26_or_later():
++            reload_script = (
++                f"sleep 2; "
++                f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
++                f"sleep 1; "
++                f"launchctl load {shlex.quote(str(plist_path))} 2>/dev/null; "
++                f"launchctl enable {shlex.quote(target)} 2>/dev/null"
++            )
++        else:
++            reload_script = (
++                f"sleep 2; "
++                f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
++                f"sleep 1; "
++                f"launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null"
++            )
+         try:
+             subprocess.Popen(
+                 ["/bin/bash", "-c", reload_script],
+@@ -3506,11 +3555,20 @@
+         check=False,
+         timeout=90,
+     )
+-    subprocess.run(
+-        ["launchctl", "bootstrap", domain, str(plist_path)],
+-        check=False,
+-        timeout=30,
+-    )
++    if _is_macos_26_or_later():
++        subprocess.run(
++            ["launchctl", "load", str(plist_path)],
++            check=False, timeout=30,
++        )
++        subprocess.run(
++            ["launchctl", "enable", target],
++            check=False, timeout=30,
++        )
++    else:
++        subprocess.run(
++            ["launchctl", "bootstrap", domain, str(plist_path)],
++            check=False, timeout=30,
++        )
+     print(
+         "↻ Updated gateway launchd service definition to match the current Hermes install"
+     )
+@@ -3538,15 +3596,11 @@
+     plist_path.write_text(new_plist)
+ 
+     try:
+-        subprocess.run(
+-            ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+-            check=True,
+-            timeout=30,
+-        )
++        _launchd_load(plist_path)
+     except subprocess.CalledProcessError as e:
+         if not _launchctl_domain_unsupported(e.returncode):
+             raise
+-        _launchd_fallback_to_detached(f"launchctl bootstrap exit {e.returncode}")
++        _launchd_fallback_to_detached(f"launchctl exit {e.returncode}")
+         return
+ 
+     print()
+@@ -3588,12 +3642,8 @@
+         plist_path.parent.mkdir(parents=True, exist_ok=True)
+         plist_path.write_text(new_plist, encoding="utf-8")
+         try:
++            _launchd_load(plist_path)
+             subprocess.run(
+-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+-                check=True,
+-                timeout=30,
+-            )
+-            subprocess.run(
+                 ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                 check=True,
+                 timeout=30,
+@@ -3616,21 +3666,17 @@
+     except subprocess.CalledProcessError as e:
+         if not _launchd_error_indicates_unloaded(e):
+             raise
+-        # Job not loaded in this domain — re-bootstrap the plist and retry.
++        # Job not loaded in this domain — re-load the plist and retry.
+         print("↻ launchd job was unloaded; reloading service definition")
+         try:
+-            subprocess.run(
+-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+-                check=True,
+-                timeout=30,
+-            )
++            _launchd_load(plist_path)
+             subprocess.run(
+                 ["launchctl", "kickstart", f"{_launchd_domain()}/{label}"],
+                 check=True,
+                 timeout=30,
+             )
+         except subprocess.CalledProcessError as e2:
+-            # Even a fresh bootstrap can't manage the domain on this host —
++            # Even a fresh load can't manage the domain on this host —
+             # degrade to a detached background process (issue #23387).
+             if not _launchctl_domain_unsupported(e2.returncode):
+                 raise
+@@ -3755,15 +3801,11 @@
+                 _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
+                 return
+             raise
+-        # Job not loaded — bootstrap and start fresh
++        # Job not loaded — load and start fresh
+         print("↻ launchd job was unloaded; reloading")
+         plist_path = get_launchd_plist_path()
+         try:
+-            subprocess.run(
+-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+-                check=True,
+-                timeout=30,
+-            )
++            _launchd_load(plist_path)
+             subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+         except subprocess.CalledProcessError as e2:
+             if not _launchctl_domain_unsupported(e2.returncode):

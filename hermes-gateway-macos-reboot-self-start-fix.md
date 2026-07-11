@@ -104,6 +104,57 @@ def _launchd_load(plist_path) -> None:
 | 微信连接 | Connected ✅ |
 | 重启后自启 | ✅（用户确认） |
 
+## PR Review 与迭代
+
+PR #62223 提交后，社区维护者 **teknium1**（Hermes Agent 作者）通过自动 code review 工具提出了 3 个问题：
+
+### Issue 1: `LimitLoadToSessionType` 无条件删除破坏了 Background-session
+**原做法**：完全删掉该 key。
+**Review 指出**：commit `360630733` 经过 #23387 的调查后特意加了 Background session 支持。全删了会让 SSH / 非 Aqua 登录场景无法加载 plist。
+**修复**：改为版本条件输出 — `_limit_load_section()` 在 macOS 26+ 省略该 key，< 26 保留 `[Aqua, Background]`。
+
+### Issue 2: 修复只覆盖了 `_launchctl_bootstrap`，遗漏了其他调用点
+**原做法**：只改了 `_launchctl_bootstrap()` 函数内部的逻辑。
+**Review 指出**：延迟重载脚本（`refresh_launchd_plist_if_needed` 内的 shell 字符串）和重启恢复（`launchd_restart` 的 unloaded 分支）直接调 `launchctl bootstrap`，走不到 `_launchctl_bootstrap()`。
+**修复**：两处都改为版本感知分支——macOS 26+ 用 `launchctl load/enable`，< 26 保留 `bootstrap`。
+
+### Issue 3: 没加测试
+**原做法**：改了 plist 输出和命令选择，0 个测试变更。
+**Review 指出**：需要 version-aware 的回归测试，覆盖新版 plist 输出和 macOS 26+ 的 load/enable 路径。
+**修复**：新增 8 个测试：
+
+| 测试 | 覆盖内容 |
+|------|---------|
+| `test_launchd_plist_omits_limit_load_on_macos_26` | macOS 26+ plist 无 `LimitLoadToSessionType` |
+| `TestLaunchctlBootstrapMacOs26`（3 个） | `load/enable` 正常 / load 失败传播 / enable 失败传播 |
+| `test_launchd_start_reloads_with_load_enable_on_macos_26` | `launchd_start()` kickstart 失败→load/enable→kickstart |
+| `test_launchd_restart_reloads_using_launchctl_bootstrap_on_macos_26` | `launchd_restart()` unloaded 分支 |
+| `TestRetryLaunchctlBootstrapUntilRegisteredMacOs26`（2 个） | retry 循环的注册验证 + TimeoutExpired 重试 |
+
+同时为现有测试（`TestLaunchctlBootstrapEioRetry`、`TestRetryLaunchctlBootstrapUntilRegistered`）添加了 `autouse fixture` 锁定 macOS < 26 路径，确保在 macOS 26.5.2 主机上也能正确运行。
+
+## 最终方案架构
+
+```
+launchctl bootstrap 调用点（6 处）
+│
+├── _launchctl_bootstrap() ← 统一入口
+│   ├── macOS < 26: launchctl bootstrap (含 EIO stale-label 恢复)
+│   └── macOS 26+:  launchctl load + launchctl enable
+│
+├── launchd_install()        → _launchctl_bootstrap() ✅
+├── launchd_start() (2 处)   → _launchctl_bootstrap() ✅
+├── launchd_restart()        → 26+: _launchctl_bootstrap() / <26: bootout+bootstrap ✅
+└── refresh_launchd_plist_if_needed()
+    ├── inline 路径          → _retry_→_launchctl_bootstrap() ✅
+    └── 延迟重载 shell 脚本  → 版本条件 shell 字符串 ✅
+```
+
+### 遗留风险
+
+- **版本检测硬编码**：`_is_macos_26_or_later()` 用 `platform.mac_ver()` 匹配主版本号。保守策略——macOS 27+ 即使修了 `bootstrap`，走 `load/enable` 也不会出错。更优雅的方案是运行时探针（先试 `bootstrap`，失败回退），但需配合 plist 生成（`_limit_load_section()`）的静态版本检测，实现复杂。
+- **stale-label 恢复**：macOS 26+ 的 `load/enable` 路径缺少 bootout 逻辑。实践中所有调用者在 load 前都已执行 bootout（`launchd_restart`、`refresh`）或处于全新安装场景（`launchd_install`、`launchd_start`），所以不会触发。作为安全边际，可在 load 前加 `launchctl bootout 2>/dev/null`。
+
 ## 涉及文件
 
 - `hermes_cli/gateway.py` — 全部修改在此文件
